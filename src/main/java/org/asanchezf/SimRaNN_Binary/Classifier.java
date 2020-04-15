@@ -9,6 +9,13 @@ import org.datavec.api.split.FileSplit;
 import org.datavec.api.transform.TransformProcess;
 import org.datavec.api.transform.schema.Schema;
 import org.deeplearning4j.datasets.datavec.RecordReaderDataSetIterator;
+import org.deeplearning4j.earlystopping.EarlyStoppingConfiguration;
+import org.deeplearning4j.earlystopping.EarlyStoppingResult;
+import org.deeplearning4j.earlystopping.saver.LocalFileModelSaver;
+import org.deeplearning4j.earlystopping.scorecalc.DataSetLossCalculator;
+import org.deeplearning4j.earlystopping.termination.MaxEpochsTerminationCondition;
+import org.deeplearning4j.earlystopping.termination.MaxTimeIterationTerminationCondition;
+import org.deeplearning4j.earlystopping.trainer.EarlyStoppingTrainer;
 import org.deeplearning4j.nn.api.OptimizationAlgorithm;
 import org.deeplearning4j.nn.conf.MultiLayerConfiguration;
 import org.deeplearning4j.nn.conf.NeuralNetConfiguration;
@@ -33,6 +40,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 public class Classifier {
@@ -49,13 +57,21 @@ public class Classifier {
         int numLinesToSkip = 0;
         char delimiter = ',';
 
-        String datasetPath = "/Users/AlbertSanchez/Desktop/Post/DatasetStatistics500/1/dataset.csv"; //DS
+        String datasetTrain = "/Users/AlbertSanchez/Desktop/Post/Tests/DatasetSplit/dataset_train.csv"; //DS
+        String datasetTest = "/Users/AlbertSanchez/Desktop/Post/Tests/DatasetSplit/dataset_test.csv"; //DS
+
+        File earlyStoppingModelFile = new File(obtainFilename(System.getProperty("user.dir") + "/resources/","EarlyStoppingDSNet"));
+        LocalFileModelSaver lfms = new LocalFileModelSaver(earlyStoppingModelFile);
 
         int numClasses = 1;  //1 class (types of incidents). 0 - No incident | 1 - Incident
         int batchSize = 512;
 
-        RecordReader recordReader = new CSVRecordReader(numLinesToSkip,delimiter);
-        recordReader.initialize(new FileSplit(new File(datasetPath)));
+        // Load Train DS
+        RecordReader recordReader1 = new CSVRecordReader(numLinesToSkip,delimiter);
+        recordReader1.initialize(new FileSplit(new File(datasetTrain)));
+        // Load Test DS
+        RecordReader recordReader2 = new CSVRecordReader(numLinesToSkip,delimiter);
+        recordReader2.initialize(new FileSplit(new File(datasetTest)));
 
         // Build a Input Schema
         Schema inputDataSchema = new Schema.Builder()
@@ -78,21 +94,22 @@ public class Classifier {
         //Second: the RecordReaderDataSetIterator handles conversion to DataSet objects, ready for use in neural network
         int labelIndex = outputSchema.getColumnNames().size() - 1;     //15 values in each row of the dataset.csv; CSV: 14 input features followed by an integer label (class) index. Labels are the 15th value (index 14) in each row
 
-        TransformProcessRecordReader transformProcessRecordReader = new TransformProcessRecordReader(recordReader,tp);
-        DataSetIterator iterator = new RecordReaderDataSetIterator(transformProcessRecordReader,batchSize,labelIndex,numClasses);
-        DataSet allData = iterator.next();
-        allData.shuffle();
-        SplitTestAndTrain testAndTrain = allData.splitTestAndTrain(0.7);  //Use 70% of data for training
-
-        DataSet trainingData = testAndTrain.getTrain();
-        DataSet testData = testAndTrain.getTest();
+        TransformProcessRecordReader transformProcessRecordReader1 = new TransformProcessRecordReader(recordReader1,tp);
+        TransformProcessRecordReader transformProcessRecordReader2 = new TransformProcessRecordReader(recordReader2,tp);
+        DataSetIterator trainingData = new RecordReaderDataSetIterator(transformProcessRecordReader1,batchSize,labelIndex,numClasses);
+        DataSetIterator testData = new RecordReaderDataSetIterator(transformProcessRecordReader2,batchSize,labelIndex,numClasses);
 
         //We need to normalize our data. We'll use NormalizeStandardize (which gives us mean 0, unit variance):
         DataNormalization normalizer = new NormalizerStandardize();
         normalizer.fit(trainingData);           //Collect the statistics (mean/stdev) from the training data. This does not modify the input data
 
-        normalizer.transform(trainingData);     //Apply normalization to the training data
-        normalizer.transform(testData);         //Apply normalization to the test data. This is using statistics calculated from the *training* set
+        while(trainingData.hasNext())
+            normalizer.transform(trainingData.next());     //Apply normalization to the training data
+        while (testData.hasNext())
+            normalizer.transform(testData.next());         //Apply normalization to the test data. This is using statistics calculated from the *training* set
+
+        trainingData.reset();
+        testData.reset();
 
         log.info("Build model....");
         MultiLayerConfiguration conf;
@@ -138,23 +155,62 @@ public class Classifier {
         model.init();
         model.setListeners(new ScoreIterationListener(100));
 
-        for(int i=0; i<5000; i++) {
-            model.fit(trainingData);
-        }
+        /* EARLY STOPPING */
 
-        // Evaluate the model on the test set
-        Evaluation eval = new Evaluation(numClasses);
-        INDArray output = model.output(testData.getFeatures());
-        eval.eval(testData.getLabels(), output);
-        log.info(eval.stats(true));
-        System.out.println(eval.stats());
+        EarlyStoppingConfiguration esConf = new EarlyStoppingConfiguration.Builder()
+                .epochTerminationConditions(new MaxEpochsTerminationCondition(5000))
+                .iterationTerminationConditions(new MaxTimeIterationTerminationCondition(60, TimeUnit.MINUTES))
+                .scoreCalculator(new DataSetLossCalculator(testData, true))
+                .evaluateEveryNEpochs(1)
+                .modelSaver(lfms)
+                .build();
+
+        EarlyStoppingTrainer trainer = new EarlyStoppingTrainer(esConf,model,trainingData);
+
+        EarlyStoppingResult result = trainer.fit();
+
+        //Print out the results:
+        System.out.println("Termination reason: " + result.getTerminationReason());
+        System.out.println("Termination details: " + result.getTerminationDetails());
+        System.out.println("Total epochs: " + result.getTotalEpochs());
+        System.out.println("Best epoch number: " + result.getBestModelEpoch());
+        System.out.println("Score at best epoch: " + result.getBestModelScore());
+
+        MultiLayerNetwork bestModel = (MultiLayerNetwork) result.getBestModel();
+
+        /* END EARLY STOPPING SECTION */
+
+        testData.reset();
+
+        // Evaluate the final model on the test set
+        Evaluation eval1 = new Evaluation(numClasses);
+        DataSet nextTestData;
+        while(testData.hasNext())
+        {
+            nextTestData = testData.next();
+            INDArray output = model.output(nextTestData.getFeatures());
+            eval1.eval(nextTestData.getLabels(),output);
+        }
+        log.info(eval1.stats(true));
+        //System.out.println(eval.stats());
+
+        testData.reset();
+        // Evaluate the model obtained from early stopping on the test set
+        Evaluation eval2 = new Evaluation(numClasses);
+        while(testData.hasNext())
+        {
+            nextTestData = testData.next();
+            INDArray output = bestModel.output(nextTestData.getFeatures());
+            eval2.eval(nextTestData.getLabels(),output);
+        }
+        log.info(eval2.stats(true));
 
         // Save the trained model
         File locationToSave; //Where to save the network. Note: the file is in .zip format - can be opened externally
 
         locationToSave = new File(obtainFilename(System.getProperty("user.dir") + "/resources/","DSNet"));
 
-        ModelSerializer.writeModel(model,locationToSave, false);
+        ModelSerializer.writeModel(bestModel,locationToSave, false);
         System.out.println("Model trained saved in: " + locationToSave.toString());
 
         // Save the statistics for the DS
