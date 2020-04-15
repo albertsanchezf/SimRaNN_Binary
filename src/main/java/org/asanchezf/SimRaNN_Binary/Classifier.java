@@ -52,6 +52,8 @@ public class Classifier {
         String datasetPath = "/Users/AlbertSanchez/Desktop/Post/DatasetStatistics500/1/dataset.csv"; //DS
 
         int numClasses = 1;  //1 class (types of incidents). 0 - No incident | 1 - Incident
+        double trainPercentage = 0.7;
+        int nEpochs = 5000;
         int batchSize = 512;
 
         RecordReader recordReader = new CSVRecordReader(numLinesToSkip,delimiter);
@@ -82,7 +84,7 @@ public class Classifier {
         DataSetIterator iterator = new RecordReaderDataSetIterator(transformProcessRecordReader,batchSize,labelIndex,numClasses);
         DataSet allData = iterator.next();
         allData.shuffle();
-        SplitTestAndTrain testAndTrain = allData.splitTestAndTrain(0.7);  //Use 70% of data for training
+        SplitTestAndTrain testAndTrain = allData.splitTestAndTrain(trainPercentage);  //Use 70% of data for training
 
         DataSet trainingData = testAndTrain.getTrain();
         DataSet testData = testAndTrain.getTest();
@@ -138,7 +140,7 @@ public class Classifier {
         model.init();
         model.setListeners(new ScoreIterationListener(100));
 
-        for(int i=0; i<5000; i++) {
+        for(int i=0; i<nEpochs; i++) {
             model.fit(trainingData);
         }
 
